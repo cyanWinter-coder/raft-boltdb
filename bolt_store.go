@@ -5,7 +5,7 @@ package raftboltdb
 
 import (
 	"errors"
-	"log"
+	"sync"
 	"time"
 
 	"github.com/boltdb/bolt"
@@ -37,6 +37,14 @@ type BoltStore struct {
 
 	// The path to the Bolt database file
 	path string
+
+	// stateMu serializes Close against all transactions. Readers hold an
+	// RLock for the lifetime of their transaction; writers and Close hold the
+	// full lock. Once closed is set, no new transaction can begin, so every
+	// operation either completes against a live database or fails with
+	// ErrStoreClosed.
+	stateMu sync.RWMutex
+	closed  bool
 }
 
 // Options contains all the configuration used to open the BoltDB
@@ -67,6 +75,12 @@ func NewBoltStore(path string) (*BoltStore, error) {
 }
 
 // New uses the supplied options to open the BoltDB and prepare it for use as a raft backend.
+//
+// Initialization is an idempotent, recoverable transaction: the buckets,
+// stored logs, stable metadata and the committed-state marker are either all
+// present together or absent together on disk. Opening an existing database
+// never resets its data; a database left half-initialized by a crash is
+// adopted on the first write or reported via ErrCorrupt on reads.
 func New(options Options) (*BoltStore, error) {
 	// Try to connect
 	handle, err := bolt.Open(options.Path, dbFileMode, options.BoltOptions)
@@ -81,104 +95,131 @@ func New(options Options) (*BoltStore, error) {
 		path: options.Path,
 	}
 
-	// If the store was opened read-only, don't try and create buckets
+	// If the store was opened read-only, don't try and create buckets or
+	// adopt an uninitialized database. Fail fast if the stored state is not
+	// fully committed.
 	if !options.readOnly() {
 		// Set up our buckets
 		if err := store.initialize(); err != nil {
 			store.Close()
 			return nil, err
 		}
+	} else if err := store.view(func(tx *bolt.Tx) error {
+		return verifyCommittedState(tx)
+	}); err != nil {
+		store.Close()
+		return nil, err
 	}
 	return store, nil
 }
 
-// initialize is used to set up all of the buckets.
+// initialize ensures the store's buckets and committed-state marker exist in
+// a single transaction. It is safe to run repeatedly: a fresh database gets
+// its initial state, an old-format or interrupted database has its existing
+// data adopted, and an already initialized database is only validated.
 func (b *BoltStore) initialize() error {
-	tx, err := b.conn.Begin(true)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil {
-			log.Printf("Rollback failed: %v", err)
-		}
-	}()
-
-	// Create all the buckets
-	if _, err := tx.CreateBucketIfNotExists(dbLogs); err != nil {
-		return err
-	}
-	if _, err := tx.CreateBucketIfNotExists(dbConf); err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	return b.update(func(tx *bolt.Tx) error {
+		return b.bootstrapCommittedState(tx)
+	})
 }
 
-// Close is used to gracefully close the DB connection.
+// checkClosed returns ErrStoreClosed once Close has run. The state lock is
+// held by the caller for the full lifetime of the transaction it guards.
+func (b *BoltStore) checkClosed() error {
+	if b.closed {
+		return errors.Join(ErrStoreClosed, bolt.ErrDatabaseNotOpen)
+	}
+	return nil
+}
+
+// view runs fn inside a read-only transaction that can only observe committed
+// state. The RLock spans the whole transaction, preventing Close from
+// closing the database underneath it.
+func (b *BoltStore) view(fn func(*bolt.Tx) error) error {
+	b.stateMu.RLock()
+	defer b.stateMu.RUnlock()
+	if err := b.checkClosed(); err != nil {
+		return err
+	}
+	return b.conn.View(fn)
+}
+
+// update runs fn inside a read-write transaction. Bootstrap or validation of
+// the committed state runs inside the same transaction before fn, so every
+// state change (including the initialization) shares one commit boundary.
+func (b *BoltStore) update(fn func(*bolt.Tx) error) error {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if err := b.checkClosed(); err != nil {
+		return err
+	}
+	return b.conn.Update(func(tx *bolt.Tx) error {
+		if err := b.bootstrapCommittedState(tx); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
+}
+
+// Close is used to gracefully close the DB connection. It is idempotent:
+// repeated calls return ErrStoreClosed without touching the underlying
+// database again, and in-flight transactions are allowed to finish first.
 func (b *BoltStore) Close() error {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if b.closed {
+		return errors.Join(ErrStoreClosed, bolt.ErrDatabaseNotOpen)
+	}
+	b.closed = true
 	return b.conn.Close()
 }
 
 // FirstIndex returns the first known index from the Raft log.
 func (b *BoltStore) FirstIndex() (uint64, error) {
-	tx, err := b.conn.Begin(false)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil {
-			log.Printf("Rollback failed: %v", err)
+	var first uint64
+	err := b.view(func(tx *bolt.Tx) error {
+		if err := verifyCommittedState(tx); err != nil {
+			return err
 		}
-	}()
-
-	curs := tx.Bucket(dbLogs).Cursor()
-	if first, _ := curs.First(); first == nil {
-		return 0, nil
-	} else {
-		return bytesToUint64(first), nil
-	}
+		st, err := readTxState(tx)
+		if err != nil {
+			return err
+		}
+		first = st.firstIndex
+		return nil
+	})
+	return first, err
 }
 
 // LastIndex returns the last known index from the Raft log.
 func (b *BoltStore) LastIndex() (uint64, error) {
-	tx, err := b.conn.Begin(false)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil {
-			log.Printf("Rollback failed: %v", err)
+	var last uint64
+	err := b.view(func(tx *bolt.Tx) error {
+		if err := verifyCommittedState(tx); err != nil {
+			return err
 		}
-	}()
-
-	curs := tx.Bucket(dbLogs).Cursor()
-	if last, _ := curs.Last(); last == nil {
-		return 0, nil
-	} else {
-		return bytesToUint64(last), nil
-	}
+		st, err := readTxState(tx)
+		if err != nil {
+			return err
+		}
+		last = st.lastIndex
+		return nil
+	})
+	return last, err
 }
 
 // GetLog is used to retrieve a log from BoltDB at a given index.
 func (b *BoltStore) GetLog(idx uint64, raftlog *raft.Log) error {
-	tx, err := b.conn.Begin(false)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil {
-			log.Printf("Rollback failed: %v", err)
+	return b.view(func(tx *bolt.Tx) error {
+		if err := verifyCommittedState(tx); err != nil {
+			return err
 		}
-	}()
-
-	bucket := tx.Bucket(dbLogs)
-	val := bucket.Get(uint64ToBytes(idx))
-
-	if val == nil {
-		return raft.ErrLogNotFound
-	}
-	return decodeMsgPack(val, raftlog)
+		val := tx.Bucket(dbLogs).Get(uint64ToBytes(idx))
+		if val == nil {
+			return raft.ErrLogNotFound
+		}
+		return decodeMsgPack(val, raftlog)
+	})
 }
 
 // StoreLog is used to store a single raft log
@@ -189,35 +230,33 @@ func (b *BoltStore) StoreLog(log *raft.Log) error {
 // StoreLogs is used to store a set of raft logs
 func (b *BoltStore) StoreLogs(logs []*raft.Log) error {
 	now := time.Now()
-	tx, err := b.conn.Begin(true)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil {
-			log.Printf("Rollback failed: %v", err)
-		}
-	}()
 
-	batchSize := 0
-	for _, log := range logs {
-		key := uint64ToBytes(log.Index)
-		val, err := encodeMsgPack(log)
-		if err != nil {
-			return err
+	err := b.update(func(tx *bolt.Tx) error {
+		batchSize := 0
+		for _, log := range logs {
+			key := uint64ToBytes(log.Index)
+			val, err := encodeMsgPack(log)
+			if err != nil {
+				return err
+			}
+
+			logLen := val.Len()
+			bucket := tx.Bucket(dbLogs)
+			if err := bucket.Put(key, val.Bytes()); err != nil {
+				return err
+			}
+			batchSize += logLen
+			metrics.AddSample([]string{"raft", "boltdb", "logSize"}, float32(logLen))
 		}
 
-		logLen := val.Len()
-		bucket := tx.Bucket(dbLogs)
-		if err := bucket.Put(key, val.Bytes()); err != nil {
-			return err
-		}
-		batchSize += logLen
-		metrics.AddSample([]string{"raft", "boltdb", "logSize"}, float32(logLen))
-	}
+		metrics.AddSample([]string{"raft", "boltdb", "logsPerBatch"}, float32(len(logs)))
+		metrics.AddSample([]string{"raft", "boltdb", "logBatchSize"}, float32(batchSize))
 
-	metrics.AddSample([]string{"raft", "boltdb", "logsPerBatch"}, float32(len(logs)))
-	metrics.AddSample([]string{"raft", "boltdb", "logBatchSize"}, float32(batchSize))
+		// Materialize the new log range in the same transaction so the range
+		// marker and the log entries share a single commit boundary.
+		return refreshCommittedState(tx)
+	})
+
 	// Both the deferral and the inline function are important for this metrics
 	// accuracy. Deferral allows us to calculate the metric after the tx.Commit
 	// has finished and thus account for all the processing of the operation.
@@ -229,78 +268,54 @@ func (b *BoltStore) StoreLogs(logs []*raft.Log) error {
 		metrics.MeasureSince([]string{"raft", "boltdb", "storeLogs"}, now)
 	}()
 
-	return tx.Commit()
+	return err
 }
 
 // DeleteRange is used to delete logs within a given range inclusively.
 func (b *BoltStore) DeleteRange(min, max uint64) error {
 	minKey := uint64ToBytes(min)
 
-	tx, err := b.conn.Begin(true)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil {
-			log.Printf("Rollback failed: %v", err)
-		}
-	}()
+	return b.update(func(tx *bolt.Tx) error {
+		curs := tx.Bucket(dbLogs).Cursor()
+		for k, _ := curs.Seek(minKey); k != nil; k, _ = curs.Next() {
+			// Handle out-of-range log index
+			if bytesToUint64(k) > max {
+				break
+			}
 
-	curs := tx.Bucket(dbLogs).Cursor()
-	for k, _ := curs.Seek(minKey); k != nil; k, _ = curs.Next() {
-		// Handle out-of-range log index
-		if bytesToUint64(k) > max {
-			break
+			// Delete in-range log index
+			if err := curs.Delete(); err != nil {
+				return err
+			}
 		}
 
-		// Delete in-range log index
-		if err := curs.Delete(); err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
+		// Commit the adjusted range together with the deletions.
+		return refreshCommittedState(tx)
+	})
 }
 
 // Set is used to set a key/value set outside of the raft log
 func (b *BoltStore) Set(k, v []byte) error {
-	tx, err := b.conn.Begin(true)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil {
-			log.Printf("Rollback failed: %v", err)
-		}
-	}()
-
-	bucket := tx.Bucket(dbConf)
-	if err := bucket.Put(k, v); err != nil {
-		return err
-	}
-
-	return tx.Commit()
+	return b.update(func(tx *bolt.Tx) error {
+		return tx.Bucket(dbConf).Put(k, v)
+	})
 }
 
 // Get is used to retrieve a value from the k/v store by key
 func (b *BoltStore) Get(k []byte) ([]byte, error) {
-	tx, err := b.conn.Begin(false)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err := tx.Rollback(); err != nil {
-			log.Printf("Rollback failed: %v", err)
+	var val []byte
+	err := b.view(func(tx *bolt.Tx) error {
+		if err := verifyCommittedState(tx); err != nil {
+			return err
 		}
-	}()
-
-	bucket := tx.Bucket(dbConf)
-	val := bucket.Get(k)
-
-	if val == nil {
-		return nil, ErrKeyNotFound
-	}
-	return append([]byte(nil), val...), nil
+		v := tx.Bucket(dbConf).Get(k)
+		if v == nil {
+			return ErrKeyNotFound
+		}
+		val = append([]byte(nil), v...)
+		return nil
+	})
+	return val, err
 }
 
 // SetUint64 is like Set, but handles uint64 values
@@ -321,5 +336,10 @@ func (b *BoltStore) GetUint64(key []byte) (uint64, error) {
 // under normal operation unless NoSync is enabled, in which this forces the
 // database file to sync against the disk.
 func (b *BoltStore) Sync() error {
+	b.stateMu.RLock()
+	defer b.stateMu.RUnlock()
+	if err := b.checkClosed(); err != nil {
+		return err
+	}
 	return b.conn.Sync()
 }
