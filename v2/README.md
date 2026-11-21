@@ -5,6 +5,30 @@ This implementation uses the maintained version of BoltDB, [BBolt](https://githu
 
 There is no breaking API change to the library. However, there is the potential for disk format incompatibilities so it was decided to be conservative and making it a separate import path. This separate import path will allow both versions (original and v2) to be imported to perform a safe in-place upgrade of old files read with the old version and written back out with the new one. 
 
+## Bounded Snapshot Store
+
+In addition to the `LogStore` and `StableStore`, this package provides `BboltSnapshotStore`, a file-based implementation of `raft.SnapshotStore` with bounded retention and coordinated deletion.
+
+Create it with a base directory and the number of completed snapshots to retain (at least one):
+
+```go
+store, err := raftboltdb.NewBboltSnapshotStore(baseDir, retain)
+```
+
+It implements the standard `Create` / `List` / `Open` interface and adds the retention helpers:
+
+* `ReapSnapshots()` removes completed snapshots beyond the retain count, oldest first. It also runs automatically each time a snapshot is finalized.
+* `DeleteSnapshot(id)` removes a single snapshot.
+
+Guarantees:
+
+* **Metadata-based ordering.** Reaping and listing order snapshots by the full metadata in each `meta.json` (`Term`, then `Index`, then `ID`), never by directory enumeration order or file name.
+* **Concurrent create vs. cleanup.** An in-progress snapshot lives in a `.tmp` directory and is registered as in-flight until finalized, so a concurrently started reaping run can never observe or delete it.
+* **Recoverable, idempotent deletion.** Each delete atomically renames the snapshot to a pending `.delete` name before removing it. If that rename fails, the snapshot is untouched and stays readable; pending directories left behind by an interrupted removal are swept on the next delete or reap. Retrying the same snapshot ID converges to success once it is absent.
+* **Readable latest and retained snapshots.** The newest snapshot cannot be deleted (`ErrSnapshotLatest`), and any snapshot with an open reader is pinned until that reader closes (`ErrSnapshotInUse`).
+
+`NewBboltSnapshotStoreWithLogger` and `NewBboltSnapshotStoreWithOptions` allow custom logging and a `NoSync` mode (unsafe, tests only).
+
 ## Metrics Emission and Compatibility
 
 This library can emit metrics using either `github.com/armon/go-metrics` or `github.com/hashicorp/go-metrics`. Choosing between the libraries is controlled via build tags. 
